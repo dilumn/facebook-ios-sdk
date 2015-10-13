@@ -1,50 +1,53 @@
-/*
- * Copyright 2010-present Facebook.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2014-present, Facebook, Inc. All rights reserved.
+//
+// You are hereby granted a non-exclusive, worldwide, royalty-free license to use,
+// copy, modify, and distribute this software in source code or binary form for use
+// in connection with the web services and APIs provided by Facebook.
+//
+// As with any software that integrates with the Facebook platform, your use of
+// this software is subject to the Facebook Developer Principles and Policies
+// [http://developers.facebook.com/policy/]. This copyright notice shall be
+// included in all copies or substantial portions of the software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #import "SCMainViewController.h"
 
 #import <AddressBook/AddressBook.h>
 #import <CoreLocation/CoreLocation.h>
 
-#import <FacebookSDK/FacebookSDK.h>
+#import <FBSDKCoreKit/FBSDKCoreKit.h>
 
-#import "SCErrorHandler.h"
 #import "SCImagePicker.h"
 #import "SCMealPicker.h"
+#import "SCPickerViewController.h"
 #import "SCSettings.h"
 #import "SCShareUtility.h"
 
-@interface SCMainViewController () <CLLocationManagerDelegate, FBFriendPickerDelegate, FBPlacePickerDelegate, SCImagePickerDelegate, SCMealPickerDelegate, SCShareUtilityDelegate>
+@interface SCMainViewController () <CLLocationManagerDelegate, SCImagePickerDelegate, SCMealPickerDelegate, SCShareUtilityDelegate>
 @property (nonatomic, strong) UIView *activityOverlayView;
-@property (nonatomic, strong, readonly) FBCacheDescriptor *friendsCacheDescriptor;
 @property (nonatomic, strong) SCImagePicker *imagePicker;
 @property (nonatomic, strong, readonly) CLLocationManager *locationManager;
 @property (nonatomic, strong) SCMealPicker *mealPicker;
-@property (nonatomic, strong) FBCacheDescriptor *placeCacheDescriptor;
-@property (nonatomic, copy) NSArray *selectedFriends;
 @property (nonatomic, copy) NSString *selectedMeal;
 @property (nonatomic, strong) UIImage *selectedPhoto;
-@property (nonatomic, strong) id<FBGraphPlace> selectedPlace;
 @property (nonatomic, strong) SCShareUtility *shareUtility;
 @end
 
+static int const MIN_USER_GENERATED_PHOTO_DIMENSION = 480;
+
 @implementation SCMainViewController
 {
-    FBCacheDescriptor *_friendsCacheDescriptor;
     CLLocationManager *_locationManager;
+    CLLocationCoordinate2D _currentLocationCoordinate;
+    NSString *_lastSegueIdentifier;
+    NSString *_selectedPlace;
+    NSArray *_selectedFriends;
 }
 
 #pragma mark - Properties
@@ -55,14 +58,6 @@
         [_activityOverlayView removeFromSuperview];
         _activityOverlayView = activityOverlayView;
     }
-}
-
-- (FBCacheDescriptor *)friendsCacheDescriptor
-{
-    if (!_friendsCacheDescriptor) {
-        _friendsCacheDescriptor = [FBFriendPickerViewController cacheDescriptor];
-    }
-    return _friendsCacheDescriptor;
 }
 
 - (void)setImagePicker:(SCImagePicker *)imagePicker
@@ -94,43 +89,6 @@
     }
 }
 
-- (FBCacheDescriptor *)placeCacheDescriptor
-{
-    if (!_placeCacheDescriptor) {
-        // Lazily create a default descriptor if location has not been detected.  This can happen if the user has
-        // declined access to location data.
-        _placeCacheDescriptor = [self _placeCacheDescriptorWithLocationCoordinate:CLLocationCoordinate2DMake(48.857875, 2.294635)];
-    }
-    return _placeCacheDescriptor;
-}
-
-- (void)setSelectedFriends:(NSArray *)selectedFriends
-{
-    if (![_selectedFriends isEqualToArray:selectedFriends]) {
-        _selectedFriends = [selectedFriends copy];
-
-        NSString *friendsSubtitle;
-        NSUInteger friendCount = _selectedFriends.count;
-        if (friendCount > 2) {
-            // Just to mix things up, don't always show the first friend.
-            id<FBGraphUser> randomFriend = [self.selectedFriends objectAtIndex:arc4random() % friendCount];
-            friendsSubtitle = [NSString stringWithFormat:@"%@ and %lu others",
-                               randomFriend.name,
-                               (unsigned long)friendCount - 1];
-        } else if (friendCount == 2) {
-            id<FBGraphUser> friend1 = [self.selectedFriends objectAtIndex:0];
-            id<FBGraphUser> friend2 = [self.selectedFriends objectAtIndex:1];
-            friendsSubtitle = [NSString stringWithFormat:@"%@ and %@",
-                               friend1.name,
-                               friend2.name];
-        } else if (friendCount == 1) {
-            id<FBGraphUser> friend = [self.selectedFriends objectAtIndex:0];
-            friendsSubtitle = friend.name;
-        }
-        self.friendsLabel.text = friendsSubtitle;
-    }
-}
-
 - (void)setSelectedMeal:(NSString *)selectedMeal
 {
     if (![_selectedMeal isEqualToString:selectedMeal]) {
@@ -145,14 +103,7 @@
     if (![_selectedPhoto isEqual:selectedPhoto]) {
         _selectedPhoto = selectedPhoto;
         self.photoView.image = selectedPhoto;
-    }
-}
-
-- (void)setSelectedPlace:(id<FBGraphPlace>)selectedPlace
-{
-    if (![_selectedPlace isEqual:selectedPlace]) {
-        _selectedPlace = selectedPlace;
-        self.locationLabel.text = _selectedPlace.name;
+        [self updateShareContent];
     }
 }
 
@@ -166,33 +117,39 @@
 
 #pragma mark - View Management
 
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    _currentLocationCoordinate = CLLocationCoordinate2DMake(48.857875, 2.294635);
+    self.profilePictureButton.profileID = @"me";
+}
+
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
 
-    self.profilePictureButton.pictureCropping = FBProfilePictureCroppingSquare;
+    self.profilePictureButton.pictureCropping = FBSDKProfilePictureModeSquare;
 
-    if ([FBSession activeSession].isOpen) {
+    if ([FBSDKAccessToken currentAccessToken]) {
         self.locationButton.enabled = YES;
         self.friendsButton.enabled = YES;
-        self.profilePictureButton.profileID = @"me";
     } else {
         self.locationButton.enabled = NO;
         self.friendsButton.enabled = NO;
-        self.profilePictureButton.profileID = nil;
     }
     self.shareButton.enabled = (self.selectedMeal != nil);
-
-    [self.friendsCacheDescriptor prefetchAndCacheForSession:[FBSession activeSession]];
+    self.shareButton.hidden = ![FBSDKAccessToken currentAccessToken];
 }
 
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
 
-    if ([FBSession activeSession].isOpen) {
+    if ([FBSDKAccessToken currentAccessToken]) {
         [self.locationManager startUpdatingLocation];
     }
+
+    [self updateShareContent];
 }
 
 #pragma mark - Actions
@@ -221,9 +178,22 @@
 
 - (IBAction)share:(id)sender
 {
+    //the SDK expects user generated images to be at least 480px in height and width.
+    //photos with the user generated flag set to false can be smaller but this sample app assumes the photo to be user generated
+    if (self.selectedPhoto && ([self.selectedPhoto size].height < MIN_USER_GENERATED_PHOTO_DIMENSION || [self.selectedPhoto size].width < MIN_USER_GENERATED_PHOTO_DIMENSION)) {
+        UIAlertView *alert = [[UIAlertView alloc]
+                              initWithTitle:[NSString stringWithFormat:@"%@%d%@", @"This photo is too small. Choose a photo with dimensions larger than ", MIN_USER_GENERATED_PHOTO_DIMENSION, @"px."]
+                              message:nil
+                              delegate:self
+                              cancelButtonTitle:@"OK"
+                              otherButtonTitles:nil];
+        [alert show];
+        return;
+    }
+
     SCShareUtility *shareUtility = [[SCShareUtility alloc] initWithMealTitle:self.selectedMeal
-                                                                       place:self.selectedPlace
-                                                                     friends:self.selectedFriends
+                                                                       place:_selectedPlace
+                                                                     friends:_selectedFriends
                                                                        photo:self.selectedPhoto];
     self.shareUtility = shareUtility;
     shareUtility.delegate = self;
@@ -232,34 +202,57 @@
 
 - (IBAction)showMain:(UIStoryboardSegue *)segue
 {
-    // This method exists in order to create an unwind segue to this controller.
+    if ([_lastSegueIdentifier isEqualToString:@"showPlacePicker"]) {
+        SCPickerViewController *vc = segue.sourceViewController;
+        if (vc.selection.count) {
+            _selectedPlace = vc.selection[0][@"id"];
+            self.locationLabel.text = vc.selection[0][@"name"];
+        } else {
+            _selectedPlace = nil;
+            self.locationLabel.text = nil;
+        }
+
+    } else if ([_lastSegueIdentifier isEqualToString:@"showFriendPicker"]) {
+        SCPickerViewController *vc = segue.sourceViewController;
+        _selectedFriends = [vc.selection valueForKeyPath:@"id"];
+        NSString *subtitle = nil;
+        if (_selectedFriends.count == 1) {
+            subtitle = vc.selection[0][@"name"];
+        } else if (_selectedFriends.count == 2) {
+            subtitle = [NSString stringWithFormat:@"%@ and %@", vc.selection[0][@"name"], vc.selection[1][@"name"]];
+        } else if (_selectedFriends.count > 2) {
+            subtitle = [NSString stringWithFormat:@"%@ and %lu others", vc.selection[0][@"name"], (unsigned long) (_selectedFriends.count - 1)];
+        } else if (_selectedFriends == 0) {
+            subtitle = nil;
+            _selectedFriends = nil;
+        }
+        self.friendsLabel.text = subtitle;
+    }
 }
 
 #pragma mark - Segues
 
 - (void)prepareForSegue:(UIStoryboardSegue *)segue sender:(id)sender
 {
-    NSString *identifier = segue.identifier;
-    if ([identifier isEqualToString:@"showPlacePicker"]) {
-        FBPlacePickerViewController *placePickerViewController = segue.destinationViewController;
-        [placePickerViewController configureUsingCachedDescriptor:self.placeCacheDescriptor];
-        [placePickerViewController loadData];
-        placePickerViewController.delegate = self;
-    } else if ([identifier isEqualToString:@"showFriendPicker"]) {
-        FBFriendPickerViewController *friendPickerViewController = segue.destinationViewController;
-        // Set up the friend picker to sort and display names the same way as the
-        // iOS Address Book does.
-
-        // Need to call ABAddressBookCreate in order for the next two calls to do anything.
-        ABAddressBookRef addressBook = ABAddressBookCreateWithOptions(NULL, NULL);
-        friendPickerViewController.sortOrdering = (ABPersonGetSortOrdering() == kABPersonSortByFirstName ? FBFriendSortByFirstName : FBFriendSortByLastName);
-        friendPickerViewController.displayOrdering = (ABPersonGetCompositeNameFormat() == kABPersonCompositeNameFormatFirstNameFirst ? FBFriendDisplayByFirstName : FBFriendDisplayByLastName);
-        CFRelease(addressBook);
-
-        [friendPickerViewController configureUsingCachedDescriptor:self.friendsCacheDescriptor];
-        [friendPickerViewController loadData];
-        friendPickerViewController.selection = self.selectedFriends;
-        friendPickerViewController.delegate = self;
+    // NOTE: for simplicity, we are not paging the results of the request.
+    _lastSegueIdentifier = segue.identifier;
+    if ([_lastSegueIdentifier isEqualToString:@"showPlacePicker"]) {
+        NSDictionary *params = @{ @"type": @"place",
+                                  @"limit": @"100",
+                                  @"center": [NSString stringWithFormat:@"%lf,%lf", _currentLocationCoordinate.latitude, _currentLocationCoordinate.longitude],
+                                  @"distance": @"100",
+                                  @"q" : @"restaurant",
+                                  @"fields" : @"id,name,picture.width(100).height(100)" };
+        SCPickerViewController *vc = segue.destinationViewController;
+        vc.request = [[FBSDKGraphRequest alloc] initWithGraphPath:@"search" parameters:params];
+        vc.allowsMultipleSelection = NO;
+    } else if ([_lastSegueIdentifier isEqualToString:@"showFriendPicker"]) {
+        SCPickerViewController *vc = segue.destinationViewController;
+        vc.requiredPermission = @"user_friends";
+        vc.request = [[FBSDKGraphRequest alloc] initWithGraphPath:@"me/taggable_friends?limit=100"
+                                                       parameters:@{ @"fields" : @"id,name,picture.width(100).height(100)"
+                                                                     }];
+        vc.allowsMultipleSelection = YES;
     }
 }
 
@@ -280,10 +273,9 @@
         ((oldLocation.coordinate.latitude != newLocation.coordinate.latitude) &&
          (oldLocation.coordinate.longitude != newLocation.coordinate.longitude) &&
          (newLocation.horizontalAccuracy <= 100.0))) {
-            // Fetch data at this new location, and remember the cache descriptor.
-            self.placeCacheDescriptor = [self _placeCacheDescriptorWithLocationCoordinate:newLocation.coordinate];
-            [self.placeCacheDescriptor prefetchAndCacheForSession:[FBSession activeSession]];
+            _currentLocationCoordinate = newLocation.coordinate;
         }
+    [self updateShareContent];
 }
 
 // unused, required delegate methods
@@ -293,29 +285,13 @@
 - (void)locationManagerDidPauseLocationUpdates:(CLLocationManager *)manager { }
 - (void)locationManagerDidResumeLocationUpdates:(CLLocationManager *)manager { }
 
-#pragma mark - FBViewControllerDelegate
-
-- (void)facebookViewControllerCancelWasPressed:(FBViewController *)sender
-{
-    [sender performSegueWithIdentifier:@"dismiss" sender:sender];
-}
-
-- (void)facebookViewControllerDoneWasPressed:(FBViewController *)sender
-{
-    if ([sender isKindOfClass:[FBPlacePickerViewController class]]) {
-        self.selectedPlace = ((FBPlacePickerViewController *)sender).selection;
-    } else if ([sender isKindOfClass:[FBFriendPickerViewController class]]) {
-        self.selectedFriends = ((FBFriendPickerViewController *)sender).selection;
-    }
-    [sender performSegueWithIdentifier:@"dismiss" sender:sender];
-}
-
 #pragma mark - SCImagePickerDelegate
 
 - (void)imagePicker:(SCImagePicker *)imagePicker didSelectImage:(UIImage *)image
 {
     self.selectedPhoto = image;
     self.imagePicker = nil;
+    self.photoViewPlaceholderLabel.hidden = YES;
 }
 
 - (void)imagePickerDidCancel:(SCImagePicker *)imagePicker
@@ -329,11 +305,14 @@
 {
     self.selectedMeal = mealType;
     self.mealPicker = nil;
+
+    [self updateShareContent];
 }
 
 - (void)mealPickerDidCancel:(SCMealPicker *)mealPicker
 {
     self.mealPicker = nil;
+    [self updateShareContent];
 }
 
 #pragma mark - SCShareUtilityDelegate
@@ -344,13 +323,23 @@
 - (void)shareUtility:(SCShareUtility *)shareUtility didFailWithError:(NSError *)error
 {
     [self _stopActivityIndicator];
-    SCHandleError(error);
+    // if there was a localized message, the automated error recovery will
+    // display it. Otherwise display a fallback message.
+    if (!error.userInfo[FBSDKErrorLocalizedDescriptionKey]) {
+        NSLog(@"Unexpected error when sharing : %@", error);
+        [[[UIAlertView alloc] initWithTitle:@"Oops"
+                                    message:@"There was a problem sharing. Please try again later."
+                                   delegate:nil
+                          cancelButtonTitle:@"OK"
+                          otherButtonTitles:nil] show];
+    }
 }
 
 - (void)shareUtilityDidCompleteShare:(SCShareUtility *)shareUtility
 {
     [self _stopActivityIndicator];
     [self _reset];
+    [[[UIAlertView alloc] initWithTitle:nil message:@"Thanks for sharing!" delegate:nil cancelButtonTitle:@"OK" otherButtonTitles:nil] show];
 }
 
 - (void)shareUtilityUserShouldLogin:(SCShareUtility *)shareUtility
@@ -361,21 +350,23 @@
 
 #pragma mark - Helper Methods
 
-- (FBCacheDescriptor *)_placeCacheDescriptorWithLocationCoordinate:(CLLocationCoordinate2D)locationCoordinate
+- (void)updateShareContent
 {
-    return [FBPlacePickerViewController cacheDescriptorWithLocationCoordinate:locationCoordinate
-                                                               radiusInMeters:1000
-                                                                   searchText:@"restaurant"
-                                                                 resultsLimit:50
-                                                             fieldsForRequest:nil];
+    SCShareUtility *shareUtility = [[SCShareUtility alloc] initWithMealTitle:self.selectedMeal
+                                                                       place:_selectedPlace
+                                                                     friends:_selectedFriends
+                                                                       photo:self.selectedPhoto];
+    FBSDKShareOpenGraphContent *content = [shareUtility contentForSharing];
+
+    self.fbSendButton.shareContent = content;
+    self.fbShareButton.shareContent = content;
 }
 
 - (void)_reset
 {
     self.selectedMeal = nil;
-    self.selectedPlace = nil;
-    self.selectedFriends = nil;
     self.selectedPhoto = nil;
+    self.photoViewPlaceholderLabel.hidden = NO;
 }
 
 - (void)_startActivityIndicator
